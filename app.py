@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -6,7 +7,7 @@ from datetime import datetime
 
 # ============================================================
 # FIELDOPS | OPERATIONAL INTELLIGENCE PLATFORM
-# Prototype v0.2 — interactive map controls
+# Prototype v0.3 — Resource Intelligence Engine
 # ============================================================
 
 st.set_page_config(
@@ -201,8 +202,21 @@ def calculate_distance(lat1, lon1, lat2, lon2):
     return float(2 * earth_radius * np.arcsin(np.sqrt(a)))
 
 
-def recommend_resource(incident):
-    """Recommend the nearest currently eligible resource."""
+def rank_resources(incident, limit=3):
+    """
+    Return the top eligible resources ranked by a transparent score.
+
+    Scoring:
+      - 60 points: proximity
+      - 25 points: resource-type compatibility
+      - 15 points: capacity
+
+    Eligibility is a hard gate: only compatible, available,
+    non-deployed resources are considered.
+
+    Scores support coordinator judgment; they do not represent
+    validated real-world response performance.
+    """
     eligible_types = COMPATIBILITY.get(
         incident["incident_type"], []
     )
@@ -216,7 +230,14 @@ def recommend_resource(incident):
     ].copy()
 
     if candidates.empty:
-        return None
+        return candidates.assign(
+            distance_km=pd.Series(dtype=float),
+            proximity_score=pd.Series(dtype=float),
+            compatibility_score=pd.Series(dtype=float),
+            capacity_score=pd.Series(dtype=float),
+            total_score=pd.Series(dtype=float),
+            rationale=pd.Series(dtype=str)
+        )
 
     candidates["distance_km"] = candidates.apply(
         lambda row: calculate_distance(
@@ -228,7 +249,42 @@ def recommend_resource(incident):
         axis=1
     )
 
-    return candidates.sort_values("distance_km").iloc[0]
+    max_distance = max(
+        float(candidates["distance_km"].max()), 0.01
+    )
+    max_capacity = max(
+        float(candidates["capacity"].max()), 1.0
+    )
+
+    candidates["proximity_score"] = (
+        60 * (1 - candidates["distance_km"] / max_distance)
+    ).clip(lower=0, upper=60)
+
+    candidates["compatibility_score"] = 25.0
+
+    candidates["capacity_score"] = (
+        15 * candidates["capacity"] / max_capacity
+    )
+
+    candidates["total_score"] = (
+        candidates["proximity_score"]
+        + candidates["compatibility_score"]
+        + candidates["capacity_score"]
+    ).round(1)
+
+    candidates["rationale"] = candidates.apply(
+        lambda row: (
+            f"{row['resource_type']} is compatible; "
+            f"{row['distance_km']:.2f} km straight-line distance; "
+            f"capacity {int(row['capacity'])}."
+        ),
+        axis=1
+    )
+
+    return candidates.sort_values(
+        ["total_score", "distance_km"],
+        ascending=[False, True]
+    ).head(limit).reset_index(drop=True)
 
 
 # -------------------- SIDEBAR / NAVIGATION ------------------
@@ -303,7 +359,7 @@ with st.sidebar:
         unsafe_allow_html=True
     )
     st.success("CORE SYSTEMS ONLINE")
-    st.caption("FIELDOPS / PROTOTYPE 0.2")
+    st.caption("FIELDOPS / PROTOTYPE 0.3")
     st.caption("DATA CLASSIFICATION: SYNTHETIC")
 
 
@@ -363,7 +419,6 @@ elif resource_filter == "Busy only":
         map_resources["status"] == "Busy"
     ]
 
-# Deployed resources are no longer available for new dispatch.
 map_resources = map_resources[
     ~map_resources["resource_id"].isin(
         st.session_state.deployed_resources
@@ -476,8 +531,10 @@ if page == "Command Center":
         st.pydeck_chart(deck, height=440)
 
         st.caption(
-            f"VISIBLE INCIDENTS: {len(map_incidents) if show_incidents else 0}  |  "
-            f"VISIBLE RESOURCES: {len(map_resources) if show_resources else 0}  |  "
+            f"VISIBLE INCIDENTS: "
+            f"{len(map_incidents) if show_incidents else 0}  |  "
+            f"VISIBLE RESOURCES: "
+            f"{len(map_resources) if show_resources else 0}  |  "
             "MAP DATA: SYNTHETIC"
         )
 
@@ -577,69 +634,165 @@ if page == "Command Center":
             incidents_df["incident_id"] == selected_id
         ].iloc[0]
 
-        recommendation = recommend_resource(incident)
+        ranked_resources = rank_resources(incident, limit=3)
 
-        left, right = st.columns([1, 1])
+        st.markdown("**INCIDENT PROFILE**")
+        profile_cols = st.columns(4)
+        profile_cols[0].metric("INCIDENT", incident["incident_id"])
+        profile_cols[1].metric("SEVERITY", incident["severity"])
+        profile_cols[2].metric(
+            "PEOPLE AFFECTED", int(incident["people_affected"])
+        )
+        profile_cols[3].metric(
+            "ELIGIBLE UNITS", len(ranked_resources)
+        )
 
-        with left:
-            st.markdown("**INCIDENT PROFILE**")
-            st.write("Incident:", incident["incident_id"])
-            st.write("Type:", incident["incident_type"])
-            st.write("Severity:", incident["severity"])
-            st.write("People affected:", incident["people_affected"])
+        st.caption(
+            "Eligibility is checked before ranking. Candidates must match "
+            "the incident type, be marked available, and not already be deployed."
+        )
 
-        with right:
-            st.markdown("**ALLOCATION RECOMMENDATION**")
+        if not ranked_resources.empty:
+            st.markdown("**TOP RESOURCE CANDIDATES**")
 
-            if recommendation is not None:
-                st.success("ELIGIBLE RESOURCE IDENTIFIED")
-                st.markdown(f"### {recommendation['resource_id']}")
-                st.write("Type:", recommendation["resource_type"])
-                st.write(
-                    "Straight-line distance:",
-                    f"{recommendation['distance_km']:.2f} km"
+            comparison = ranked_resources[
+                [
+                    "resource_id", "resource_type", "distance_km",
+                    "capacity", "proximity_score",
+                    "compatibility_score", "capacity_score", "total_score"
+                ]
+            ].copy()
+
+            comparison.columns = [
+                "Resource", "Type", "Distance (km)", "Capacity",
+                "Proximity", "Compatibility", "Capacity score", "Total score"
+            ]
+
+            comparison["Distance (km)"] = (
+                comparison["Distance (km)"].round(2)
+            )
+
+            st.dataframe(
+                comparison,
+                use_container_width=True,
+                hide_index=True
+            )
+
+            candidate_labels = [
+                f"{row['resource_id']} — {row['resource_type']} "
+                f"({row['total_score']:.1f}/100)"
+                for _, row in ranked_resources.iterrows()
+            ]
+
+            selected_candidate_label = st.radio(
+                "Choose a candidate to inspect",
+                candidate_labels,
+                index=0,
+                horizontal=True
+            )
+
+            selected_candidate_index = candidate_labels.index(
+                selected_candidate_label
+            )
+
+            selected_resource = ranked_resources.iloc[
+                selected_candidate_index
+            ]
+
+            detail_left, detail_right = st.columns([1.2, 1])
+
+            with detail_left:
+                st.markdown("**WHY THIS RESOURCE?**")
+
+                st.success(
+                    f"{selected_resource['resource_id']} is ranked "
+                    f"#{selected_candidate_index + 1} of the eligible candidates."
                 )
+
+                st.write(
+                    f"- **Compatibility:** {selected_resource['resource_type']} "
+                    f"is eligible for {incident['incident_type']}."
+                )
+
+                st.write(
+                    f"- **Proximity:** {selected_resource['distance_km']:.2f} km "
+                    "straight-line distance."
+                )
+
+                st.write(
+                    f"- **Capacity:** {int(selected_resource['capacity'])} "
+                    "synthetic capacity units."
+                )
+
                 st.caption(
-                    "Geographic proximity estimate only; "
-                    "not a road-route or travel-time calculation."
+                    "The score is a prototype decision-support heuristic, "
+                    "not a validated emergency-response model."
                 )
+
+            with detail_right:
+                st.markdown("**SCORE BREAKDOWN**")
+
+                st.progress(
+                    min(float(selected_resource["total_score"]) / 100, 1.0),
+                    text=(
+                        f"Total score: "
+                        f"{selected_resource['total_score']:.1f}/100"
+                    )
+                )
+
                 st.write(
-                    "Selection basis: compatible resource, available "
-                    "status, and shortest eligible distance."
+                    f"Proximity: {selected_resource['proximity_score']:.1f}/60"
                 )
 
-                if st.button(
-                    "APPROVE & RECORD ASSIGNMENT",
-                    use_container_width=True
-                ):
-                    assignment = {
-                        "timestamp": datetime.now().strftime(
-                            "%Y-%m-%d %H:%M:%S"
-                        ),
-                        "incident_id": selected_id,
-                        "resource_id": recommendation["resource_id"],
-                        "resource_type": recommendation["resource_type"],
-                        "distance_km": round(
-                            recommendation["distance_km"], 2
-                        ),
-                        "decision": "APPROVED"
-                    }
-
-                    st.session_state.assignments.append(assignment)
-                    st.session_state.deployed_resources.add(
-                        recommendation["resource_id"]
-                    )
-                    st.session_state.assigned_incidents[selected_id] = (
-                        recommendation["resource_id"]
-                    )
-
-                    st.success("Assignment recorded.")
-                    st.rerun()
-            else:
-                st.warning(
-                    "No eligible available resource found. "
-                    "Coordinator intervention required."
+                st.write(
+                    f"Compatibility: "
+                    f"{selected_resource['compatibility_score']:.1f}/25"
                 )
+
+                st.write(
+                    f"Capacity: {selected_resource['capacity_score']:.1f}/15"
+                )
+
+            if st.button(
+                "APPROVE & RECORD SELECTED ASSIGNMENT",
+                use_container_width=True
+            ):
+                assignment = {
+                    "timestamp": datetime.now().strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    ),
+                    "incident_id": selected_id,
+                    "resource_id": selected_resource["resource_id"],
+                    "resource_type": selected_resource["resource_type"],
+                    "distance_km": round(
+                        float(selected_resource["distance_km"]), 2
+                    ),
+                    "decision_score": float(
+                        selected_resource["total_score"]
+                    ),
+                    "rank_at_approval": selected_candidate_index + 1,
+                    "decision": "APPROVED"
+                }
+
+                st.session_state.assignments.append(assignment)
+
+                st.session_state.deployed_resources.add(
+                    selected_resource["resource_id"]
+                )
+
+                st.session_state.assigned_incidents[selected_id] = (
+                    selected_resource["resource_id"]
+                )
+
+                st.success("Assignment recorded.")
+                st.rerun()
+
+        else:
+            st.warning(
+                "No eligible available resource found. "
+                "Coordinator intervention required."
+            )
+
     else:
         st.info("No unassigned incidents match the selected filters.")
 
@@ -651,9 +804,11 @@ elif page == "Incident Registry":
     st.caption("REGISTERED EMERGENCY REQUESTS")
 
     display = incidents_df.copy()
+
     display["status"] = display["incident_id"].apply(
         lambda x: (
-            "ASSIGNED" if x in st.session_state.assigned_incidents
+            "ASSIGNED"
+            if x in st.session_state.assigned_incidents
             else "OPEN"
         )
     )
@@ -664,12 +819,20 @@ elif page == "Incident Registry":
     ]
 
     if critical_only:
-        display = display[display["severity"] == "Critical"]
+        display = display[
+            display["severity"] == "Critical"
+        ]
 
     if not show_assigned:
-        display = display[display["status"] != "ASSIGNED"]
+        display = display[
+            display["status"] != "ASSIGNED"
+        ]
 
-    st.dataframe(display, use_container_width=True, hide_index=True)
+    st.dataframe(
+        display,
+        use_container_width=True,
+        hide_index=True
+    )
 
 
 # -------------------- RESOURCE REGISTRY ---------------------
@@ -679,6 +842,7 @@ elif page == "Resource Registry":
     st.caption("RESPONSE RESOURCE STATUS")
 
     display = resources_df.copy()
+
     display["status"] = display.apply(
         lambda row: (
             "DEPLOYED"
@@ -689,11 +853,20 @@ elif page == "Resource Registry":
     )
 
     if resource_filter == "Available only":
-        display = display[display["status"] == "Available"]
-    elif resource_filter == "Busy only":
-        display = display[display["status"] == "Busy"]
+        display = display[
+            display["status"] == "Available"
+        ]
 
-    st.dataframe(display, use_container_width=True, hide_index=True)
+    elif resource_filter == "Busy only":
+        display = display[
+            display["status"] == "Busy"
+        ]
+
+    st.dataframe(
+        display,
+        use_container_width=True,
+        hide_index=True
+    )
 
 
 # -------------------- DECISION LOG --------------------------
@@ -703,9 +876,21 @@ elif page == "Decision Log":
     st.caption("RECORDED RESOURCE ALLOCATION DECISIONS")
 
     if st.session_state.assignments:
-        log = pd.DataFrame(st.session_state.assignments)
-        st.dataframe(log, use_container_width=True, hide_index=True)
-        st.metric("TOTAL RECORDED DECISIONS", len(log))
+        log = pd.DataFrame(
+            st.session_state.assignments
+        )
+
+        st.dataframe(
+            log,
+            use_container_width=True,
+            hide_index=True
+        )
+
+        st.metric(
+            "TOTAL RECORDED DECISIONS",
+            len(log)
+        )
+
     else:
         st.info(
             "No decisions recorded. "
@@ -716,6 +901,7 @@ elif page == "Decision Log":
 # -------------------- FOOTER --------------------------------
 
 st.divider()
+
 st.markdown(
     """
     <div style="display:flex;justify-content:space-between;">
@@ -723,7 +909,7 @@ st.markdown(
             FIELDOPS / OPERATIONAL INTELLIGENCE
         </span>
         <span style="color:#64748B;font-size:11px;">
-            PROTOTYPE 0.2 / SYNTHETIC DATA
+            PROTOTYPE 0.3 / SYNTHETIC DATA / HEURISTIC SCORING
         </span>
     </div>
     """,
